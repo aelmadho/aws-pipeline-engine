@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Initial roles for child accounts
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterLabels:
+      CentralAwsAccountId:
+        default: Shared Services account ID
+      TargetAccountRoleName:
+        default: serverless-cicdrole
+Parameters:
+  CentralAwsAccountId:
+    Description: The AWS account ID of the shared services account, from step 1.3. For guidance, see Finding Your AWS Account ID in the AWS documentation.
+    Default: ""
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: must be an AWS account ID
+  TargetAccountRoleName:
+    Description: The name of the role to create in the development account. This name must be unique in the development account.
+    Default: pipeline-bp-role
+    Type: String
+  ProjectPrefix:
+    Description: Team/Project identifier used to prefix resources provisioned, and limit IAM role access. 
+    Default: dph
+    Type: String
+Resources:
+  TargetAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectPrefix}-${TargetAccountRoleName}"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Ref CentralAwsAccountId
+            Service:
+              - cloudformation.amazonaws.com
+              - codebuild.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: CfnStackAssumeRole
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudformation:CreateStack
+            - cloudformation:DeleteStack
+            - cloudformation:DescribeStacks
+            - cloudformation:UpdateStack
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - iam:PutRolePermissionsBoundary
+            - iam:List*
+            - iam:Get*
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - iam:CreateRole
+            - iam:DeleteRole
+            - iam:GetRole
+            - iam:PassRole
+            - iam:DetachRolePolicy
+            - iam:AttachRolePolicy
+            - iam:PutRolePolicy
+            - iam:DeleteRolePolicy
+            Resource: 
+            - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectPrefix}-*-PipelineServiceRole-*
+            - !Sub arn:aws:iam::${AWS::AccountId}:role/${ProjectPrefix}-*-PipelineDeploymentRole-*
+            # Condition:
+            #   StringEquals:
+            #     iam:PermissionsBoundary:
+            #     - !Sub arn:aws:iam::${AWS::AccountId}:policy/boundary-role
+        #   - Action:
+        #     - iam:CreatePolicyversion
+        #     - iam:DeletePolicy
+        #     - iam:DeletePolicyversion
+        #     - iam:SetDefaultPolicyversion
+        #     Resource:
+        #     - arn:aws:iam::*:policy/boundary-role
+        #     Effect: Deny
+        #     Sid: DenyPBModify
+        #   - Action:
+        #     - iam:DeleteRolePermissionsBoundary
+        #     Resource: "*"
+        #     Effect: Deny
+            # Sid: DenyPBDelete
+
+Outputs:
+  RemoteAccountRole:
+    Value: !GetAtt TargetAccountRole.Arn
+    Export:
+      Name: !Sub "${ProjectPrefix}-pipeline-RemoteAccountRole"
+  RemoteAccountRoleName:
+    Value: !Ref TargetAccountRoleName
+    Export:
+      Name: !Sub "${ProjectPrefix}-pipeline-RemoteAccountRoleName"

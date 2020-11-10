@@ -1,0 +1,744 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Common CI/CD resources for the shared services account.
+
+Parameters:
+  DevAwsAccountId:
+    Description: AWS account ID for development account
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: Must be an AWS account ID
+  TestAwsAccountId:
+    Description: AWS account ID for test/qa account
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: Must be an AWS account ID
+  ProdAwsAccountId:
+    Description: AWS account ID for production account
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: Must be an AWS account ID
+  LogAwsAccountId:
+    Description: AWS account ID for production account
+    Type: String
+    AllowedPattern: (\d{12}|^$)
+    ConstraintDescription: Must be an AWS account ID
+  ChildAccountRole:
+    Description: IAM role name used in child development accounts
+    Type: String
+    Default: pipeline-bp-role	
+  DeploymentBucketName:
+    Description: The name of shared serverless deployment bucket 
+    Default: dph-lz-sls-deploy-bucket
+    Type: String
+  ProjectPrefix:
+    Description: Team/Project identifier used to prefix resources provisioned, and limit IAM role access. 
+    Default: dph
+    Type: String
+  PipelineEngineBucketName:
+    Description: The name of shared serverless deployment bucket 
+    Default: dph-pipeline-engine-bucket
+    Type: String
+
+Resources:
+
+ ##########################################################################################################################
+# Across Account Setup Automation (Lambda) - Used for Custom Resources
+##########################################################################################################################
+  CrossAccountSetupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: CfnStackAssumeRole
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource:
+            - arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - sts:AssumeRole
+            Resource: "*"
+          - Effect: Allow
+            Action:
+            - lambda:AddPermission
+            - lambda:RemovePermission
+            Resource:  "*"
+          - Effect: Allow
+            Action:
+            - events:PutRule
+            - events:DeleteRule
+            - events:PutTargets
+            - events:RemoveTargets
+            Resource:  "*"
+
+  CrossAccountSetupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt CrossAccountSetupLambdaRole.Arn
+      Runtime: python3.6
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import os, boto3, json, signal, traceback
+          from botocore.vendored import requests
+
+          def get_cfn_parameters(e):
+              params = []
+              cfnp = e['ResourceProperties']['CfnParameters']
+              for p in cfnp.keys():
+                  params.append({"ParameterKey": p, "ParameterValue": cfnp[p]})
+              return params
+
+          def get_client(service, e, c):
+              sts_client = boto3.client('sts')
+              response = sts_client.assume_role(RoleArn=e['ResourceProperties']['RoleArn'],RoleSessionName='CrossAccountCfnStack')
+              session = boto3.Session(aws_access_key_id=response['Credentials']['AccessKeyId'],aws_secret_access_key=response['Credentials']['SecretAccessKey'],aws_session_token=response['Credentials']['SessionToken'])
+              return session.client(service)
+
+          def update(e, c):
+              cf_client = get_client("cloudformation", e, c)
+              rp = e['ResourceProperties']
+              try:
+                response = cf_client.update_stack(
+                    StackName=e["PhysicalResourceId"],
+                    TemplateBody=rp['TemplateBody'],
+                    Parameters=get_cfn_parameters(e),
+                    Capabilities=rp['Capabilities']
+                )
+              except ClientError as er:
+                if "No updates are to be performed" not in str(er):
+                    raise
+              waiter = cf_client.get_waiter('stack_update_complete')
+              waiter.wait(StackName=e["PhysicalResourceId"])
+              return response['StackId']
+
+          def create(e, c):
+              cf_client = get_client("cloudformation", e, c)
+              rp = e['ResourceProperties']
+              response = cf_client.create_stack(
+                StackName=rp['StackName'],
+                TemplateBody=rp['TemplateBody'],
+                Parameters=get_cfn_parameters(e),
+                Capabilities=rp['Capabilities']
+              )
+              waiter = cf_client.get_waiter('stack_create_complete')
+              waiter.wait(StackName=rp['StackName'])
+              return response['StackId']
+
+          def delete(e, c):
+              cf_client = get_client("cloudformation", e, c)
+              response = cf_client.delete_stack(StackName=e["PhysicalResourceId"])
+              waiter = cf_client.get_waiter('stack_delete_complete')
+              waiter.wait(StackName=e["PhysicalResourceId"])
+              return True
+
+          def lambda_handler(e, c):
+              signal.alarm(int(c.get_remaining_time_in_millis() / 1000) - 1)
+              try:
+                  print('event: {}'.format(json.dumps(e)))
+                  if e['RequestType'] == 'Create':
+                      e['PhysicalResourceId'] = create(e, c)
+                      send_response(e, c, "SUCCESS", {"Message": "Resource creation successful!"})
+                  elif e['RequestType'] == 'Update':
+                      e['PhysicalResourceId'] = update(e, c)
+                      send_response(e, c, "SUCCESS", {"Message": "Resource update successful!"})
+                  elif e['RequestType'] == 'Delete':
+                      delete(e, c)
+                      send_response(e, c, "SUCCESS", {"Message": "Resource deletion successful!"})
+                  else:
+                      send_response(e, c, "FAILED", {"Message": "Unexpected event received from CF"})
+              except Exception as er:
+                  traceback.print_exc()
+                  send_response(e, c, "FAILED", {"Message": "Exception during processing"})
+
+          def send_response(e, c, response_status, response_data):
+              if not e.get('PhysicalResourceId'):
+                  e['PhysicalResourceId'] = c.log_stream_name
+              _rb = {
+                  "Status": response_status,
+                  "Reason": "See the details in CloudWatch Log Stream: " + c.log_stream_name,
+                  "StackId": e['StackId'],
+                  "RequestId": e['RequestId'],
+                  "LogicalResourceId": e['LogicalResourceId'],
+                  "PhysicalResourceId": e['PhysicalResourceId'],
+                  "Data": response_data
+              }
+              rb = json.dumps(_rb)
+
+              print('ResponseBody: %s', rb)
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(rb))
+              }
+              try:
+                  response = requests.put(e['ResponseURL'], data=rb, headers=headers)
+                  print("CF returned status code: " + response.reason)
+              except Exception as e:
+                  print("send(..) failed executing requests.put(..): " + str(e))
+                  raise
+
+          def timeout_handler(_signal, _frame):
+              raise Exception('Time exceeded')
+
+          signal.signal(signal.SIGALRM, timeout_handler)
+
+##########################################################################################################################
+# Serverless (SLS) Deployment Bucket
+##########################################################################################################################
+  DeploymentBucket:
+    DependsOn: CICDBucketKey
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DeploymentBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Sub ${CICDBucketKey.Arn}
+              SSEAlgorithm: aws:kms
+
+
+  DeploymentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DeploymentBucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !Sub ${DeploymentBucket.Arn}
+              - !Sub ${DeploymentBucket.Arn}/*
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+          - Action:
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+              - s3:GetObjectVersion
+            Effect: Allow
+            Resource:
+              - !Sub ${DeploymentBucket.Arn}
+              - !Sub ${DeploymentBucket.Arn}/*
+            Principal:
+              AWS:
+                  - !Sub arn:aws:iam::${DevAwsAccountId}:root	
+                  - !Sub arn:aws:iam::${TestAwsAccountId}:root
+                  - !Sub arn:aws:iam::${ProdAwsAccountId}:root	
+
+##########################################################################################################################
+# Pipeline Engine (S3 Bucket)
+##########################################################################################################################
+  PipelineEngineBucket:
+    DependsOn: CICDBucketKey
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref PipelineEngineBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              KMSMasterKeyID: !Sub ${CICDBucketKey.Arn}
+              SSEAlgorithm: aws:kms
+
+  PipelineEngineBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DeploymentBucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:*
+            Effect: Allow
+            Resource:
+              - !Sub ${DeploymentBucket.Arn}
+              - !Sub ${DeploymentBucket.Arn}/*
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${AWS::AccountId}:root
+          - Action:
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+              - s3:GetObjectVersion
+            Effect: Allow
+            Resource:
+              - !Sub ${DeploymentBucket.Arn}
+              - !Sub ${DeploymentBucket.Arn}/*
+            Principal:
+              AWS:
+                  - !Sub arn:aws:iam::${DevAwsAccountId}:root	
+                  - !Sub arn:aws:iam::${TestAwsAccountId}:root
+                  - !Sub arn:aws:iam::${ProdAwsAccountId}:root	
+
+##########################################################################################################################
+# KMS Keys
+##########################################################################################################################
+  CICDBucketKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Code & Deployment Artifact Key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: !Ref AWS::StackName
+        Statement:
+          - Sid: Allows admin of the key
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: Allow use of the key for CodePipeline
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub arn:aws:iam::${DevAwsAccountId}:root
+                - !Sub arn:aws:iam::${TestAwsAccountId}:root
+                - !Sub arn:aws:iam::${ProdAwsAccountId}:root
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow access through Amazon S3 for all principals in the accounts that are authorized to use Amazon S3
+            Effect: Allow
+            Principal:
+              AWS: '*'
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub s3.${AWS::Region}.amazonaws.com
+                kms:CallerAccount:
+                  - !Ref AWS::AccountId
+                  - !Ref DevAwsAccountId
+                  - !Ref TestAwsAccountId
+                  - !Ref ProdAwsAccountId
+
+  CICDBucketKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectPrefix}-CodePipeline"
+      TargetKeyId: !Ref CICDBucketKey
+
+
+
+
+##########################################################################################################################
+# Pipeline Engine
+##########################################################################################################################
+  PipelineEngineCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeCommitReadOnly
+        - arn:aws:iam::aws:policy/AWSCloudFormationFullAccess
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - lambda:InvokeFunction
+                Effect: Allow
+                Resource:
+                  - !GetAtt CrossAccountSetupLambda.Arn 
+                Sid: LambdaInvoke
+            Version: '2012-10-17'
+          PolicyName: LambdaPolicy
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+            Version: '2012-10-17'
+          PolicyName: PipelineEngine-CodeBuild-Policy
+      RoleName: PipelineEngine-CodeBuild-Role
+
+  PipelineEngineCodeBuild:
+    Type: AWS::CodeBuild::Project
+    DependsOn: PipelineEngineCodeBuildRole
+    Properties:
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Description: CodeBuild Project to pull from a GIT repository containing
+        a CodePipeline file "pipeline.yaml" and parameters file "pipeline.conf".
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:4.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: PIPELINE_ENGINE_BUCKET
+            Value: !Ref PipelineEngineBucket
+            Type: PLAINTEXT
+      Name: PipelineEngineCodeBuild
+      ServiceRole: !Ref PipelineEngineCodeBuildRole
+      Source:
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - echo Phase INSTALL was STARTED on `date`
+                - echo "Installing Pre-Requisites..."
+                - python3 -m pip install pip --upgrade || exit 1
+              finally:
+                - echo Phase INSTALL was COMPLETED on `date`
+                - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo 'INSTALL SUCCESSFUL'; else echo 'INSTALL FAILED'; exit 1; fi
+            build:
+              commands:
+                - echo Phase BUILD was STARTED on `date`
+
+                - |
+                  set -e
+                  BRANCH_STRIPPED=$(echo $BRANCH | cut -d "-" -f 1)
+                  echo ">>>>>>>>>>>>>>>>> BRANCH >>>>>>>>>>>>>>>>"
+                  echo "BRANCH: $BRANCH"
+                  echo "BRANCH_STRIPPED: $BRANCH_STRIPPED"
+                  echo ">>>>>>>>>>>>>>>>> BRANCH >>>>>>>>>>>>>>>>"   
+                  
+                  echo ">>>>>>>>>>>>>>>>> S3 Bucket >>>>>>>>>>>>>>>>"
+                  aws s3 cp pipeline.yaml s3://${PIPELINE_ENGINE_BUCKET}/${REPOSITORY_NAME}/pipeline.yaml
+                  echo ">>>>>>>>>>>>>>>>> S3 Bucket >>>>>>>>>>>>>>>>"
+                  
+                  if [ "$EVENT_TYPE" = "referenceDeleted" ]; then
+                    if aws cloudformation describe-stacks --region ${AWS_DEFAULT_REGION} --stack-name ${REPOSITORY_NAME}-pipeline-${BRANCH_STRIPPED}; then
+                      echo "Skipping pipeline deletion"
+                      # aws cloudformation delete-stack  --region ${AWS_DEFAULT_REGION} --stack-name ${REPOSITORY_NAME}-pipeline-${BRANCH_STRIPPED}
+                    fi
+                  else 
+                    ##########################################################################################################################
+                    # PipelineTrigger
+                    ##########################################################################################################################
+                    # CHANGESET_TYPE=""
+                    STACK_NAME="${REPOSITORY_NAME}-pipeline-trigger"
+                    aws cloudformation deploy --s3-bucket ${PIPELINE_ENGINE_BUCKET} --s3-prefix ${REPOSITORY_NAME} --template-file pipeline.yaml --stack-name ${STACK_NAME} --parameter-overrides Branch=""  BranchName="" AppName=${REPOSITORY_NAME} EnablePipelineTrigger="true" --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+
+
+                    ##########################################################################################################################
+                    # Pipeline (master | release)
+                    ##########################################################################################################################
+                    POLL_FOR_SOURCE_CHANGES="false"
+                    if [ "$BRANCH_STRIPPED" = "release" ]; then
+                      echo "Release branch, turn on source code polling"
+                      POLL_FOR_SOURCE_CHANGES="true"
+                    fi
+
+                    STACK_NAME="${REPOSITORY_NAME}-pipeline-${BRANCH_STRIPPED}"
+                    aws cloudformation deploy --s3-bucket ${PIPELINE_ENGINE_BUCKET} --s3-prefix ${REPOSITORY_NAME} --template-file pipeline.yaml --stack-name ${STACK_NAME} --parameter-overrides PollForSourceChanges=${POLL_FOR_SOURCE_CHANGES} Branch=${BRANCH_STRIPPED}  BranchName=${BRANCH} AppName=${REPOSITORY_NAME} --no-fail-on-empty-changeset --capabilities CAPABILITY_NAMED_IAM
+                  fi
+              finally:
+                - echo Phase BUILD was COMPLETED on `date`
+                - if [ "$CODEBUILD_BUILD_SUCCEEDING" -eq 1 ]; then echo 'BUILD SUCCESSFUL'; else echo 'BUILD FAILED'; exit 1; fi
+        Type: NO_SOURCE
+
+##########################################################################################################################
+# Pipeline Engine Trigger
+##########################################################################################################################
+  PipelineEngineLambdaTrigger:
+    Type: AWS::Lambda::Function
+    DependsOn: PipelineEngineLambdaTriggerRole
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+          CODE_BUILD_PROJECT = os.getenv('CODE_BUILD_PROJECT')
+          codecommit_client = boto3.client('codecommit')
+          cb = boto3.client('codebuild')
+          config_files_monitored = ["pipeline.yaml"]
+          allowed_branches = ["master", "release"]
+          def lambda_handler(event, context):              
+              try:
+                  old_commit_id = event["detail"]["oldCommitId"]
+              except KeyError:
+                  old_commit_id = None
+              try:
+                  new_commit_id = event["detail"]["commitId"]
+              except KeyError:
+                  new_commit_id = None
+              repo_name = event["detail"]["repositoryName"]
+              region = event["region"]
+              branch = event["detail"]["referenceName"]
+              branch_stripped = branch.split("-")[0]
+              event_type = event["detail"]["event"]
+              doTriggerBuild = False
+              codecommit_response = None
+              if branch_stripped not in allowed_branches:
+                  print ("Branch not supported for pipeline engine, skipped.")
+                  return "Success"
+              if old_commit_id and new_commit_id:
+                  codecommit_response = codecommit_client.get_differences(
+                  repositoryName=str(repo_name),
+                  beforeCommitSpecifier=str(old_commit_id),
+                  afterCommitSpecifier=str(new_commit_id)
+                  )
+              if not old_commit_id and new_commit_id:
+                  codecommit_response = codecommit_client.get_differences(
+                  repositoryName=str(repo_name),
+                  afterCommitSpecifier=str(new_commit_id)
+                  )   
+              if event_type == "referenceDeleted":
+                  doTriggerBuild = True
+              else:
+                  for difference in codecommit_response["differences"]:
+                      file_name = difference["afterBlob"]["path"].lower()
+                      if file_name in config_files_monitored:
+                          doTriggerBuild = True
+                    
+              if doTriggerBuild:
+                  if event_type == "referenceDeleted":
+                      build = {
+                          'projectName': CODE_BUILD_PROJECT,
+                          'environmentVariablesOverride': [
+                              {
+                                  'name': 'REPOSITORY_NAME',
+                                  'value': repo_name,
+                                  'type': 'PLAINTEXT'
+                              },
+                              {
+                                  'name': 'BRANCH',
+                                  'value': branch,
+                                  'type': 'PLAINTEXT'
+                              },
+                              {
+                                  'name': 'EVENT_TYPE',
+                                  'value': event_type,
+                                  'type': 'PLAINTEXT'
+                              }
+                          ]
+                      }
+                  else:
+                      build = {
+                          'projectName': CODE_BUILD_PROJECT,
+                          'sourceVersion': new_commit_id,
+                          'sourceTypeOverride': 'CODECOMMIT',
+                          'sourceLocationOverride': 'https://git-codecommit.%s.amazonaws.com/v1/repos/%s' % (region, repo_name),
+                          'environmentVariablesOverride': [
+                              {
+                                  'name': 'AWS_DEFAULT_REGION',
+                                  'value': region,
+                                  'type': 'PLAINTEXT'
+                              },
+                              {
+                                  'name': 'REPOSITORY_NAME',
+                                  'value': repo_name,
+                                  'type': 'PLAINTEXT'
+                              },
+                              {
+                                  'name': 'BRANCH',
+                                  'value': branch,
+                                  'type': 'PLAINTEXT'
+                              },
+                              {
+                                  'name': 'EVENT_TYPE',
+                                  'value': event_type,
+                                  'type': 'PLAINTEXT'
+                              },
+                              {
+                                  'name': 'COMMIT_HASH',
+                                  'value': new_commit_id,
+                                  'type': 'PLAINTEXT'
+                              }
+                          ]
+                      }
+                  cb.start_build(**build)
+              else:
+                  print('Changed files does not match any triggers.')
+              return 'Success.'
+        
+        
+      Description: Lambda function that will recieve CodeCommit events and will trigger
+        CodeBuild pipeline engine.
+      FunctionName: PipelineEngine-Lambda-Trigger
+      Handler: index.lambda_handler
+      MemorySize: 512
+      Role: !GetAtt PipelineEngineLambdaTriggerRole.Arn
+      Runtime: python3.6
+      Timeout: 300
+      Environment:
+        Variables:
+          CODE_BUILD_PROJECT: !Ref PipelineEngineCodeBuild
+
+  PipelineEngineLambdaTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+                Sid: LogAccessPolicy
+              - Action:
+                  - codecommit:GetTree
+                  - codecommit:BatchGetCommits
+                  - codecommit:GetCommit
+                  - codecommit:GetCommitHistory
+                  - codecommit:GetDifferences
+                  - codecommit:GetReferences
+                  - codecommit:GetObjectIdentifier
+                  - codecommit:BatchGetCommits
+                Effect: Allow
+                Resource:
+                  - '*' #TODO: Limit this
+                Sid: CodeCommitRead
+              - Action:
+                  - codebuild:StartBuild
+                Effect: Allow
+                Resource:
+                  - !GetAtt PipelineEngineCodeBuild.Arn
+                Sid: CodeBuildStartPolicy
+            Version: '2012-10-17'
+          PolicyName: PipelineEngine-Lambda-Policy
+      RoleName: PipelineEngine-Lambda-Role
+
+  PermissionToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PipelineEngineLambdaTrigger
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PipelineEngineLambdaTriggerRule.Arn
+
+  PipelineEngineLambdaTriggerRule:
+    Type: AWS::Events::Rule
+    Properties: 
+      Name: PipelineEngine-CodeBuild-Rule
+      Description: 'Rule to trigger pipeline creation from CodeCommit merge'
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - 'CodeCommit Repository State Change'
+        detail:
+          event: 
+            - referenceCreated
+            - referenceUpdated
+            - referenceDeleted
+        # resources:
+        #   - !Sub "arn:aws:codecommit:us-east-1:${AWS::AccountId}:${ProjectPrefix}-*"
+      State: ENABLED
+      Targets: 
+        - Arn: !GetAtt PipelineEngineLambdaTrigger.Arn
+          Id: lambda
+
+  CloudWatchEventsCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: events-invoke-codebuild
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Resource: !GetAtt PipelineEngineCodeBuild.Arn
+                Action: 
+                  - codebuild:StartBuild
+
+Outputs:
+  DeploymentBucket:
+    Description: Bucket used when packaging serverless templates
+    Value: !Ref DeploymentBucket
+    Export:
+      Name: !Sub "${ProjectPrefix}-pipeline-DeploymentBucket"
+  DeploymentBucketArn:
+    Description: Bucket used when packaging serverless templates
+    Value: !GetAtt DeploymentBucket.Arn
+    Export:
+      Name: !Sub "${ProjectPrefix}-pipeline-DeploymentBucketArn"
+  CICDBucketKeyArn:
+    Description: KMS key for codepipelines and artifacts
+    Value: !GetAtt CICDBucketKey.Arn
+    Export:
+      Name: !Sub "${ProjectPrefix}-pipeline-CICDBucketKeyArn"
+  CICDBucketKeyId:
+    Description: KMS key ID for codepipelines and artifacts
+    Value: !Ref CICDBucketKey
+    Export:
+      Name: !Sub "${ProjectPrefix}-pipeline-CICDBucketKeyId"
+  CICDBucketKeyAlias:
+    Description: KMS key alias for codepipelines and deployment artifacts
+    Value: !Ref CICDBucketKeyAlias
+    Export:
+      Name: !Sub "${ProjectPrefix}-pipeline-CICDBucketKeyAlias"
+  CrossAccountSetupLambdaArn:
+    Description: Lambda used to setup accounts for CI/CD operations
+    Value: !GetAtt CrossAccountSetupLambda.Arn
+    Export:
+      Name: !Sub "${ProjectPrefix}-pipeline-CrossAccountSetupLambdaArn"
